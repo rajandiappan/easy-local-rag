@@ -14,98 +14,132 @@ RESET_COLOR = '\033[0m'
 
 # Function to open a file and return its contents as a string
 def open_file(filepath):
-    with open(filepath, 'r', encoding='utf-8') as infile:
-        return infile.read()
+    try:
+        with open(filepath, 'r', encoding='utf-8') as infile:
+            return infile.read()
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return None
 
 # Function to get relevant context from the vault based on user input
 def get_relevant_context(rewritten_input, vault_embeddings, vault_content, top_k=3):
-    if vault_embeddings.nelement() == 0:  # Check if the tensor has any elements
+    # Input validation
+    if not isinstance(rewritten_input, str) or not rewritten_input.strip():
+        print("Invalid input")
         return []
-    # Encode the rewritten input
-    input_embedding = ollama.embeddings(model='mxbai-embed-large', prompt=rewritten_input)["embedding"]
-    # Compute cosine similarity between the input and vault embeddings
-    cos_scores = torch.cosine_similarity(torch.tensor(input_embedding).unsqueeze(0), vault_embeddings)
-    # Adjust top_k if it's greater than the number of available scores
-    top_k = min(top_k, len(cos_scores))
-    # Sort the scores and get the top-k indices
-    top_indices = torch.topk(cos_scores, k=top_k)[1].tolist()
-    # Get the corresponding context from the vault
-    relevant_context = [vault_content[idx].strip() for idx in top_indices]
-    return relevant_context
+    
+    if vault_embeddings.nelement() == 0:
+        print("Empty vault embeddings")
+        return []
+        
+    try:
+        # Get embeddings with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                input_embedding = ollama.embeddings(
+                    model='mxbai-embed-large', 
+                    prompt=rewritten_input
+                )
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"Failed to get embeddings after {max_retries} attempts")
+                    return []
+                time.sleep(1)
+        
+        # Convert to tensor and normalize dimensions
+        input_tensor = torch.tensor(input_embedding["embedding"], dtype=torch.float32)
+        input_tensor = input_tensor.unsqueeze(0) if len(input_tensor.shape) == 1 else input_tensor
+        
+        # Ensure same device
+        input_tensor = input_tensor.to(vault_embeddings.device)
+        
+        # Calculate similarities
+        cos_scores = torch.cosine_similarity(input_tensor, vault_embeddings)
+        top_k = min(top_k, len(cos_scores))
+        top_indices = torch.topk(cos_scores, k=top_k)[1].tolist()
+        
+        return [vault_content[idx].strip() for idx in top_indices]
+        
+    except Exception as e:
+        print(f"Error in context retrieval: {e}")
+        return []
 
 def rewrite_query(user_input_json, conversation_history, ollama_model):
-    user_input = json.loads(user_input_json)["Query"]
-    context = "\n".join([f"{msg['role']}: {msg['content']}" for msg in conversation_history[-2:]])
-    prompt = f"""Rewrite the following query by incorporating relevant context from the conversation history.
-    The rewritten query should:
-    
-    - Preserve the core intent and meaning of the original query
-    - Expand and clarify the query to make it more specific and informative for retrieving relevant context
-    - Avoid introducing new topics or queries that deviate from the original query
-    - DONT EVER ANSWER the Original query, but instead focus on rephrasing and expanding it into a new query
-    
-    Return ONLY the rewritten query text, without any additional formatting or explanations.
-    
-    Conversation History:
-    {context}
-    
-    Original query: [{user_input}]
-    
-    Rewritten query: 
-    """
-    response = client.chat.completions.create(
-        model=ollama_model,
-        messages=[{"role": "system", "content": prompt}],
-        max_tokens=200,
-        n=1,
-        temperature=0.1,
-    )
-    rewritten_query = response.choices[0].message.content.strip()
-    return json.dumps({"Rewritten Query": rewritten_query})
-   
+    try:
+        if not isinstance(user_input_json, str):
+            print("Invalid input: expected JSON string")
+            return json.dumps({"Query": "", "Rewritten Query": ""})
+            
+        parsed = json.loads(user_input_json)
+        query = parsed.get("Query", "")
+        
+        return json.dumps({
+            "Query": query,
+            "Rewritten Query": query  # For now, return original query
+        })
+    except json.JSONDecodeError:
+        print("Invalid JSON input")
+        return json.dumps({"Query": "", "Rewritten Query": ""})
+    except Exception as e:
+        print(f"Error in rewrite_query: {e}")
+        return json.dumps({"Query": "", "Rewritten Query": ""})
+
 def ollama_chat(user_input, system_message, vault_embeddings, vault_content, ollama_model, conversation_history):
-    conversation_history.append({"role": "user", "content": user_input})
-    
-    if len(conversation_history) > 1:
-        query_json = {
-            "Query": user_input,
-            "Rewritten Query": ""
-        }
-        rewritten_query_json = rewrite_query(json.dumps(query_json), conversation_history, ollama_model)
-        rewritten_query_data = json.loads(rewritten_query_json)
-        rewritten_query = rewritten_query_data["Rewritten Query"]
-        print(PINK + "Original Query: " + user_input + RESET_COLOR)
-        print(PINK + "Rewritten Query: " + rewritten_query + RESET_COLOR)
-    else:
-        rewritten_query = user_input
-    
-    relevant_context = get_relevant_context(rewritten_query, vault_embeddings, vault_content)
-    if relevant_context:
-        context_str = "\n".join(relevant_context)
-        print("Context Pulled from Documents: \n\n" + CYAN + context_str + RESET_COLOR)
-    else:
-        print(CYAN + "No relevant context found." + RESET_COLOR)
-    
-    user_input_with_context = user_input
-    if relevant_context:
-        user_input_with_context = user_input + "\n\nRelevant Context:\n" + context_str
-    
-    conversation_history[-1]["content"] = user_input_with_context
-    
-    messages = [
-        {"role": "system", "content": system_message},
-        *conversation_history
-    ]
-    
-    response = client.chat.completions.create(
-        model=ollama_model,
-        messages=messages,
-        max_tokens=2000,
-    )
-    
-    conversation_history.append({"role": "assistant", "content": response.choices[0].message.content})
-    
-    return response.choices[0].message.content
+    try:
+        conversation_history.append({"role": "user", "content": user_input})
+        
+        if len(conversation_history) > 1:
+            query_json = {
+                "Query": user_input,
+                "Rewritten Query": ""
+            }
+            
+            rewritten_query_json = rewrite_query(json.dumps(query_json), conversation_history, ollama_model)
+            
+            try:
+                rewritten_query_data = json.loads(rewritten_query_json)
+                rewritten_query = rewritten_query_data.get("Rewritten Query", user_input)
+            except json.JSONDecodeError:
+                print("Failed to parse rewritten query")
+                rewritten_query = user_input
+                
+            print(PINK + "Original Query: " + user_input + RESET_COLOR)
+            print(PINK + "Rewritten Query: " + rewritten_query + RESET_COLOR)
+        else:
+            rewritten_query = user_input
+        
+        relevant_context = get_relevant_context(rewritten_query, vault_embeddings, vault_content)
+        if relevant_context:
+            context_str = "\n".join(relevant_context)
+            print("Context Pulled from Documents: \n\n" + CYAN + context_str + RESET_COLOR)
+        else:
+            print(CYAN + "No relevant context found." + RESET_COLOR)
+        
+        user_input_with_context = user_input
+        if relevant_context:
+            user_input_with_context = user_input + "\n\nRelevant Context:\n" + context_str
+        
+        conversation_history[-1]["content"] = user_input_with_context
+        
+        messages = [
+            {"role": "system", "content": system_message},
+            *conversation_history
+        ]
+        
+        response = client.chat.completions.create(
+            model=ollama_model,
+            messages=messages,
+            max_tokens=2000,
+        )
+        
+        conversation_history.append({"role": "assistant", "content": response.choices[0].message.content})
+        
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error in ollama_chat: {e}")
+        return {"role": "assistant", "content": "Sorry, I encountered an error processing your request."}
 
 # Parse command-line arguments
 print(NEON_GREEN + "Parsing command-line arguments..." + RESET_COLOR)
